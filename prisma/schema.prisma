@@ -1,0 +1,279 @@
+// DevBoard — esquema de datos
+// Jerarquía: Workspace → Project → Column → Task → (Subtask | Comment | Activity)
+// Las etiquetas viven a nivel Workspace para reutilizarse entre proyectos.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── Enums ───────────────────────────────
+
+enum Role {
+  ADMIN
+  MEMBER
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum EstimateUnit {
+  POINTS
+  HOURS
+}
+
+/// Semántica de la columna. Permite renombrar columnas sin perder
+/// el significado (p. ej. marcar completedAt al entrar en DONE).
+enum ColumnKind {
+  BACKLOG
+  TODO
+  IN_PROGRESS
+  REVIEW
+  DONE
+}
+
+enum ActivityType {
+  CREATED
+  STATUS_CHANGED
+  TITLE_CHANGED
+  DESCRIPTION_CHANGED
+  PRIORITY_CHANGED
+  ESTIMATE_CHANGED
+  ASSIGNEE_ADDED
+  ASSIGNEE_REMOVED
+  LABEL_ADDED
+  LABEL_REMOVED
+}
+
+// ─────────────────────────────── Identidad ───────────────────────────────
+
+model User {
+  id          String  @id @default(cuid())
+  /// ID del proveedor de auth (Clerk). Se enlaza en el primer login por email.
+  clerkId     String? @unique
+  email       String  @unique
+  name        String?
+  avatarUrl   String?
+  githubLogin String?
+
+  memberships  WorkspaceMember[]
+  assignments  TaskAssignee[]
+  createdTasks Task[]            @relation("TaskCreator")
+  comments     Comment[]
+  activities   Activity[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Workspace {
+  id   String @id @default(cuid())
+  name String
+  slug String @unique
+
+  members  WorkspaceMember[]
+  projects Project[]
+  labels   Label[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Tabla pivote User ↔ Workspace con rol (Admin / Member).
+model WorkspaceMember {
+  id          String    @id @default(cuid())
+  role        Role      @default(MEMBER)
+  userId      String
+  workspaceId String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  joinedAt DateTime @default(now())
+
+  @@unique([userId, workspaceId])
+  @@index([workspaceId])
+}
+
+// ─────────────────────────────── Proyectos ───────────────────────────────
+
+model Project {
+  id          String  @id @default(cuid())
+  name        String
+  /// Prefijo corto para las claves de tarea: DEV → DEV-42
+  key         String
+  description String?
+  /// Contador monotónico para numerar tareas (DEV-1, DEV-2, ...).
+  taskCounter Int     @default(0)
+
+  workspaceId String
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  columns Column[]
+  tasks   Task[]
+  sprints Sprint[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([workspaceId, key])
+}
+
+/// Columna/estado del tablero. Orden por `position` (float fraccional).
+model Column {
+  id       String     @id @default(cuid())
+  name     String
+  kind     ColumnKind
+  position Float
+  wipLimit Int?
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks     Task[]
+
+  @@index([projectId, position])
+}
+
+model Sprint {
+  id        String    @id @default(cuid())
+  name      String
+  goal      String?
+  startDate DateTime?
+  endDate   DateTime?
+  isActive  Boolean   @default(false)
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tasks     Task[]
+
+  @@index([projectId, isActive])
+}
+
+// ─────────────────────────────── Tareas ───────────────────────────────
+
+model Task {
+  id           String       @id @default(cuid())
+  number       Int
+  title        String
+  /// Markdown
+  description  String?
+  priority     Priority     @default(MEDIUM)
+  estimate     Float?
+  estimateUnit EstimateUnit @default(POINTS)
+  /// Orden dentro de la columna (indexación fraccional: midpoint entre vecinos).
+  position     Float
+  dueDate      DateTime?
+  completedAt  DateTime?
+
+  projectId String
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  columnId  String
+  column    Column  @relation(fields: [columnId], references: [id], onDelete: Restrict)
+  sprintId  String?
+  sprint    Sprint? @relation(fields: [sprintId], references: [id], onDelete: SetNull)
+  creatorId String
+  creator   User    @relation("TaskCreator", fields: [creatorId], references: [id])
+
+  assignees  TaskAssignee[]
+  labels     TaskLabel[]
+  subtasks   Subtask[]
+  comments   Comment[]
+  activities Activity[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([projectId, number])
+  @@index([columnId, position])
+  @@index([projectId, priority])
+}
+
+/// N:M Task ↔ User (múltiples asignados).
+model TaskAssignee {
+  taskId     String
+  userId     String
+  task       Task     @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assignedAt DateTime @default(now())
+
+  @@id([taskId, userId])
+  @@index([userId])
+}
+
+model Label {
+  id    String @id @default(cuid())
+  name  String
+  /// Hex, p. ej. "#ef4444"
+  color String
+
+  workspaceId String
+  workspace   Workspace   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  tasks       TaskLabel[]
+
+  @@unique([workspaceId, name])
+}
+
+/// N:M Task ↔ Label.
+model TaskLabel {
+  taskId  String
+  labelId String
+  task    Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  label   Label  @relation(fields: [labelId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, labelId])
+  @@index([labelId])
+}
+
+model Subtask {
+  id       String  @id @default(cuid())
+  title    String
+  done     Boolean @default(false)
+  position Float
+
+  taskId String
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([taskId, position])
+}
+
+model Comment {
+  id   String @id @default(cuid())
+  /// Markdown (soporta bloques de código con resaltado)
+  body String
+
+  taskId   String
+  task     Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([taskId, createdAt])
+}
+
+/// Historial de cambios (audit log por tarea).
+model Activity {
+  id      String       @id @default(cuid())
+  type    ActivityType
+  /// Detalle del cambio, p. ej. { "from": {...}, "to": {...} }
+  payload Json?
+
+  taskId  String
+  task    Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  actorId String
+  actor   User   @relation(fields: [actorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([taskId, createdAt])
+}
